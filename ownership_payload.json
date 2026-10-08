@@ -1,23 +1,249 @@
-{
-  "payload_hash": "42a8b7ddc038e24cd2d3efa8e5adeaa54d11e5f3b3e4483e326da5a7a98936dd",
-  "leaf_hash": "065a533e01c0f7e03a08bb7e208c909bde063541e4bbe6c5b76a579d381c22f3",
-  "origin_merkle_root": "dace10ffde51b74efcccae1fc5eaac9553fcca35e547eb747b60e5d013b7cad0",
-  "ownership_claim": {
-    "claim_type": "OWNERSHIP_ASSERTION",
-    "claimant": "George Anthony Newberry",
-    "asset_id": "ASSET123",
-    "merkle_root": "dace10ffde51b74efcccae1fc5eaac9553fcca35e547eb747b60e5d013b7cad0",
-    "timestamp": "2026-10-03T03:18:02Z"
-  },
-  "signature_bundle": {
-    "prefix": "00",
-    "signature_algorithm": "secp256k1",
-    "public_key": "02e0b1158a183d211ebcf45a1c3132e4d07b3b3a62dd9a54a01053feaa4dc68bcd",
-    "signature": "304402204c35b54a2cb5ff1eb2cbbbf837a72d7cf7993a4695bbf32d56a2dfb42b10a2bb02207185cd2a58b991da7142dd23aa4d284a1e94119d672223a54b4cd811ae23d5bb"
-  },
-  "bitcoin_anchor": {
-    "chain": "bitcoin-regtest",
-    "block_height": 101,
-    "block_hash": "0000000000000000000000000000000000000000000000000000000000000065"
-  }
-}
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import sys
+from datetime import datetime
+
+try:
+    from ecdsa import BadSignatureError, SECP256k1, VerifyingKey
+except Exception:  # pragma: no cover
+    BadSignatureError = None
+    SECP256k1 = None
+    VerifyingKey = None
+
+
+def is_hex(value, expected_length=None):
+    if not isinstance(value, str):
+        return False
+    if len(value) % 2 != 0:
+        return False
+    if expected_length is not None and len(value) != expected_length:
+        return False
+    try:
+        bytes.fromhex(value)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_utc_timestamp(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ") == value
+    except ValueError:
+        return False
+
+
+def canonical_json(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def sha256_hex(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def canonicalize_hmac_payload(payload):
+    frm = payload["from"]
+    to = payload["to"]
+    user_id = payload["userId"]
+    payload_type = payload["type"]
+    timestamp = payload["timestamp"]
+    origin_code = payload["originCode"]
+    from_lat = format(float(frm["lat"]), ".6f")
+    from_lon = format(float(frm["lon"]), ".6f")
+    to_lat = format(float(to["lat"]), ".6f")
+    to_lon = format(float(to["lon"]), ".6f")
+    return f"{user_id}|{payload_type}|{timestamp}|{from_lat}:{from_lon}|{to_lat}:{to_lon}|{origin_code}"
+
+
+def validate_hmac_payload(payload):
+    errors = []
+    required = ["userId", "type", "from", "to", "timestamp", "originCode", "signature"]
+    for key in required:
+        if key not in payload:
+            errors.append(f"missing required field: {key}")
+
+    if errors:
+        return {"valid": False, "errors": errors, "mode": "hmac"}
+
+    try:
+        frm = payload["from"]
+        to = payload["to"]
+        lat1 = float(frm["lat"])
+        lon1 = float(frm["lon"])
+        lat2 = float(to["lat"])
+        lon2 = float(to["lon"])
+    except (TypeError, ValueError, KeyError):
+        errors.append("from/to coordinates must be numeric latitude/longitude pairs")
+        lat1 = lon1 = lat2 = lon2 = None
+
+    if lat1 is not None:
+        if not (-90.0 <= lat1 <= 90.0):
+            errors.append("from.lat is out of range [-90, 90]")
+        if not (-180.0 <= lon1 <= 180.0):
+            errors.append("from.lon is out of range [-180, 180]")
+        if not (-90.0 <= lat2 <= 90.0):
+            errors.append("to.lat is out of range [-90, 90]")
+        if not (-180.0 <= lon2 <= 180.0):
+            errors.append("to.lon is out of range [-180, 180]")
+
+    if not parse_utc_timestamp(payload["timestamp"]):
+        errors.append("timestamp must be ISO-8601 UTC in the form YYYY-MM-DDTHH:MM:SSZ")
+
+    expected_origin = f"GUN-{payload['userId']}-ORIGIN-{format(float(payload['to']['lat']), '.6f')}:{format(float(payload['to']['lon']), '.6f')}"
+    if payload.get("originCode") != expected_origin:
+        errors.append(f"originCode mismatch: expected {expected_origin}")
+
+    canonical = canonicalize_hmac_payload(payload)
+    if not payload.get("signature"):
+        errors.append("missing signature")
+    elif not is_hex(payload["signature"], 64):
+        errors.append("signature must be a 64-character hex string")
+
+    return {
+        "valid": not errors,
+        "mode": "hmac",
+        "canonical_string": canonical,
+        "errors": errors,
+    }
+
+
+def validate_ownership_payload(payload):
+    errors = []
+
+    required_top = ["payload_hash", "leaf_hash", "origin_merkle_root", "ownership_claim", "signature_bundle", "bitcoin_anchor"]
+    for key in required_top:
+        if key not in payload:
+            errors.append(f"missing required field: {key}")
+
+    if errors:
+        return {"valid": False, "errors": errors, "mode": "ownership"}
+
+    if not is_hex(payload["payload_hash"], 64):
+        errors.append("payload_hash must be a 64-character hex SHA-256 digest")
+    if not is_hex(payload["leaf_hash"], 64):
+        errors.append("leaf_hash must be a 64-character hex SHA-256 digest")
+    if not is_hex(payload["origin_merkle_root"], 64):
+        errors.append("origin_merkle_root must be a 64-character hex digest")
+
+    claim = payload["ownership_claim"]
+    if not isinstance(claim, dict):
+        errors.append("ownership_claim must be an object")
+        claim = {}
+
+    if not claim.get("claimant"):
+        errors.append("ownership_claim.claimant is required")
+    if not claim.get("asset_id"):
+        errors.append("ownership_claim.asset_id is required")
+
+    if "claim_type" in claim and claim.get("claim_type") != "OWNERSHIP_ASSERTION":
+        errors.append("ownership_claim.claim_type must be OWNERSHIP_ASSERTION")
+    if "merkle_root" in claim and claim.get("merkle_root") != payload.get("origin_merkle_root"):
+        errors.append("ownership_claim.merkle_root must equal origin_merkle_root")
+    if "timestamp" in claim and not parse_utc_timestamp(claim.get("timestamp")):
+        errors.append("ownership_claim.timestamp must be ISO-8601 UTC in the form YYYY-MM-DDTHH:MM:SSZ")
+
+    bundle = payload["signature_bundle"]
+    if not isinstance(bundle, dict):
+        errors.append("signature_bundle must be an object")
+        bundle = {}
+
+    key_prefix = bundle.get("key_prefix") or bundle.get("prefix")
+    public_key = bundle.get("public_key")
+    if not isinstance(public_key, str):
+        errors.append("signature_bundle.public_key must be a string")
+    else:
+        if key_prefix and public_key.startswith(key_prefix):
+            public_key = public_key[len(key_prefix):]
+        if not is_hex(public_key, 66):
+            errors.append("signature_bundle.public_key must be a 66-character hex compressed secp256k1 public key")
+        elif not public_key.startswith(("02", "03")):
+            errors.append("signature_bundle.public_key must use a compressed secp256k1 format starting with 02 or 03")
+
+    if bundle.get("signature_algorithm") not in (None, "secp256k1"):
+        errors.append("signature_bundle.signature_algorithm must be secp256k1")
+
+    signature = bundle.get("signature")
+    if not isinstance(signature, str):
+        errors.append("signature_bundle.signature must be a string")
+    else:
+        if len(signature) % 2 != 0 or len(signature) < 128 or len(signature) > 200:
+            errors.append("signature_bundle.signature length is outside expected DER-size range")
+        if not is_hex(signature):
+            errors.append("signature_bundle.signature must be hex-encoded")
+
+    claim_hash = bundle.get("claim_hash")
+    expected_claim_hash = sha256_hex(canonical_json(claim))
+    if claim_hash is not None and claim_hash != expected_claim_hash:
+        errors.append("signature_bundle.claim_hash does not match canonical ownership_claim hash")
+
+    if VerifyingKey is not None and isinstance(public_key, str) and isinstance(signature, str) and claim_hash:
+        try:
+            vk = VerifyingKey.from_string(bytes.fromhex(public_key), curve=SECP256k1)
+            vk.verify(bytes.fromhex(signature), bytes.fromhex(claim_hash))
+        except Exception as exc:  # pragma: no cover
+            errors.append(f"signature verification failed: {exc}")
+
+    bitcoin = payload["bitcoin_anchor"]
+    if not isinstance(bitcoin, dict):
+        errors.append("bitcoin_anchor must be an object")
+    else:
+        if bitcoin.get("chain") != "bitcoin-regtest":
+            errors.append("bitcoin_anchor.chain must be bitcoin-regtest")
+        if not isinstance(bitcoin.get("block_height"), int) or bitcoin["block_height"] <= 0:
+            errors.append("bitcoin_anchor.block_height must be a positive integer")
+        if not is_hex(bitcoin.get("block_hash"), 64):
+            errors.append("bitcoin_anchor.block_hash must be a 64-character hex block hash")
+
+    hash_input = {k: v for k, v in payload.items() if k != "payload_hash"}
+    canonical = canonical_json(hash_input)
+    actual_hash = sha256_hex(canonical)
+    if payload["payload_hash"] != actual_hash:
+        errors.append("payload_hash does not match the canonical JSON payload")
+
+    return {
+        "valid": not errors,
+        "mode": "ownership",
+        "canonical_json_hash": actual_hash,
+        "claim_hash": expected_claim_hash,
+        "errors": errors,
+    }
+
+
+def detect_mode(payload):
+    if isinstance(payload, dict) and "ownership_claim" in payload and "signature_bundle" in payload:
+        return "ownership"
+    return "hmac"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Validate Genesis ownership or HMAC payloads.")
+    parser.add_argument("--payload", required=True, help="Path to a JSON payload file.")
+    parser.add_argument("--secret", help="Optional secret for HMAC validation only.")
+    args = parser.parse_args()
+
+    try:
+        with open(args.payload, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        print(json.dumps({"valid": False, "errors": [f"unable to read payload: {exc}"], "mode": "unknown"}, indent=2))
+        return 1
+
+    mode = detect_mode(payload)
+    if mode == "ownership":
+        result = validate_ownership_payload(payload)
+    else:
+        if args.secret is None:
+            print(json.dumps({"valid": False, "errors": ["--secret is required for HMAC payload validation"], "mode": "hmac"}, indent=2))
+            return 1
+        result = validate_hmac_payload(payload)
+
+    print(json.dumps(result, indent=2))
+    return 0 if result["valid"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
